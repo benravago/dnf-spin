@@ -1,0 +1,273 @@
+#!/usr/bin/python3
+
+import os, sys
+import re
+import argparse
+import configparser
+import mimetypes
+import time
+import traceback
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+ENV = None
+
+def main():
+  parse_args()
+  check_args()
+  parse_conf()
+  check_conf()
+  make_map()
+  cull_map()
+  start_server()
+  return
+
+def parse_args():
+  global ENV
+  parser = argparse.ArgumentParser()
+  parser.add_argument('-c','--config',help='service configuration file',default='/etc/dnf/plugins/spin.conf')
+  ENV = vars(parser.parse_args())
+  return
+
+def check_args():
+  cf = env('config')
+  if not os.path.exists(cf):
+    fail('config file not found:',cf)
+  ENV['config'] = os.path.abspath(cf)
+  return
+
+def parse_conf():
+  config = configparser.ConfigParser()
+  config.read(env('config'))
+  ENV['main'] = dict(config.items('main'))
+  ENV['spindl'] = dict(config.items('spindl'))
+  return
+
+def check_conf():
+  check_spinsdir()
+  check_rootdir()
+  return
+
+def check_spinsdir():
+  sd = env('main','spinsdir')
+  if not sd or not os.path.exists(sd):
+    fail('spins directory not found:',sd)
+  return
+
+def check_rootdir():
+  rd = env('spindl','rootdir')
+  if rd and rd[0] == '.':
+    ENV['spindl']['rootdir'] = os.path.abspath(sibling(ENV['config'],rd))
+  return
+
+def make_map():
+  map = {}
+  sd = env('main','spinsdir')
+  for sf in os.listdir(sd):
+    dn = os.path.join(sd,sf)
+    if os.path.isdir(dn):
+      fn = os.path.join(dn,'spin.conf')
+      if os.path.isfile(fn):
+        cf = configparser.ConfigParser()
+        cf.read(fn)
+        d = dict(cf.items('main'))
+        rd = repo_dir(d,fn)
+        if rd:
+          d['repodir'] = rd
+          d['path'] = fn
+          map[sf] = d
+        ##
+      else: 
+        warn('no file:',fn)
+    else:
+      warn('no directory:',dn)
+  ##
+  ENV['spins'] = map;
+  return
+
+def repo_dir(d,fn):
+  f = d['repodir'] if 'repodir' in d else './repo'
+  f = f if f[0] == '/' else os.path.abspath(sibling(fn,f))
+  return f if os.path.isdir(f) else None
+
+def cull_map():
+  ## TODO: implement 'include', 'exclude'
+  return
+
+def start_server():
+  hostname = env('spindl','hostname') or ''
+  port = env('spindl','port') or '5050'
+
+  myServer = HTTPServer((hostname,int(port)),MyHandler)
+  sayHello(myServer)
+
+  try:
+    myServer.serve_forever()
+  except KeyboardInterrupt:
+    pass
+
+  myServer.server_close()
+  sayGoodbye()
+  return
+
+
+class MyHandler(BaseHTTPRequestHandler):
+
+  def do_GET(self):
+    try:
+      self.send_it()
+    except Exception as err:
+      traceback.print_exc()
+      self.send_error(404)
+    return 
+
+  def send_it(self):
+    p0 = self.path
+    p1,p2 = chomp(p0)
+    if p1 == 'spin':
+      self.send_spin(p2)
+    else:
+      self.send_local(p0)
+    return
+
+  def send_spin(self,path):
+    p1,p2 = chomp(path)
+    dir = env('spins',p1,'repodir')
+    if dir:
+      self.send_path(dir,p2)
+    else:
+      self.send_error(404)
+    return
+
+  def send_local(self,path):
+    dir = env('spindl','rootdir')
+    if dir:
+      self.send_path(dir,path)
+    else:
+      self.send_error(404)
+    return
+
+  def send_path(self,dir,file):
+    path = dir + file
+    if not os.path.exists(path):
+      self.send_error(404)
+    elif os.path.isfile(path):
+      self.send_file(path)
+    elif path[-1] == '/':
+      self.send_html(dirpage(path))
+    else:
+      self.send_redirect(self.path+'/')
+    return
+
+  def send_html(self,text):
+    self.send_response(200)
+    self.send_header('Content-type','text/html')
+    self.end_headers()
+    self.wfile.write(bytes(text,'utf-8'))
+    return
+ 
+  def send_file(self,file):
+    ct = mimetype(file)
+    f = open(file,'rb')
+    self.send_response(200)
+    self.send_header('Content-type',ct)
+    self.end_headers()
+    self.wfile.write(f.read())
+    f.close()
+    return
+
+  def send_redirect(self,url):
+    self.send_response(302)
+    self.send_header('Location',url)
+    self.end_headers()
+    return
+
+
+### subroutines
+
+def sayHello(web):
+  hostname = '%s:%d' % web.server_address
+  url = 'http://'+hostname
+
+  print(time.asctime(),'start',hostname)
+  print()
+  spins = env('spins')
+  for key in spins:
+    spin = spins[key]
+    print(url+'/spin/'+key+'/* ->',spin['repodir']+'/*')
+  ##
+  print(url+'/* ->',env('spindl','rootdir')+'/*') 
+  print()
+  return
+
+def sayGoodbye():
+  print(time.asctime(),'stop.')
+  return
+
+def dirpage(path):
+  h = [
+    '<!doctype html>',
+    '<head>',
+    '<meta charset="utf-8">',
+    '<title>',path,'</title>',
+    '<style>a{text-decoration:none;}</style>',
+    '</head>',
+    '<body>',
+    '<br/><a href=".."><b>..</b></a>' ];
+  h.extend(dirlist(path))
+  h.extend([
+    '</body>',
+    '</html>'])
+  return "".join(h)
+
+def dirlist(path):
+  h = []
+  for e in sorted(os.listdir(path)):
+    f = os.path.join(path,e)
+    if os.path.isfile(f):
+      h.extend(['<br/><a href="',e,'">',e,'</a>'])
+    elif os.path.isdir(f):
+      h.extend(['<br/><a href="',e,'"><b>',e,'</b></a>'])
+  ## 
+  return h
+
+def sibling(a,b):
+  return os.path.join(os.path.dirname(a),b)
+
+def mimetype(url):
+  t = mimetypes.guess_type(url)
+  return t[0] if t[0] else 'application/octet-stream'
+
+def chomp(s):
+  m = len(s)
+  i = 0
+  while i < m and s[i] == '/':
+    i = i + 1
+  j = i
+  while j < m and s[j] != '/':
+    j = j + 1
+  ##
+  return s[i:j], s[j:]
+
+def env(*keys):
+  d = ENV
+  for k in keys:
+    if k in d:
+      d = d[k];
+    else:
+      return None
+  ##
+  return d
+
+def warn(*m):
+  print ('>',*m)
+  return
+
+def fail(*m):
+  print ('>>',*m)
+  sys.exit(1)
+
+
+######
+main() if __name__ == "__main__" else None
+

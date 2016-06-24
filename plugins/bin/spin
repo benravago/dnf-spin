@@ -1,0 +1,17 @@
+#
+set -x
+
+# spin <id> ... -> dnf --setopt=plugin... --spin=<id> ...
+
+D=$(readlink -f $0)
+D=${D%/*}
+D=${D%/*}
+
+S=$1
+shift
+
+dnf \
+  --setopt=pluginpath=${D}/lib \
+  --setopt=pluginconfpath=${D}/etc \
+  --spin=${S} $*
+
