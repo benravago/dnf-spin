@@ -1,5 +1,4 @@
-#
-set -x
+#!/usr/bin/bash
 
 # spin <id> ... -> dnf --setopt=plugin... --spin=<id> ...
 
